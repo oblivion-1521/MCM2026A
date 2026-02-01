@@ -2,13 +2,11 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
+
 from nasa_battery_reader import load_battery_data
 from battery_physics import cul_SOC, get_OCV, total_voltage_model
 
 def get_clean_data_from_cycle(cycle_data, cycle_id):
-    """
-    清洗数据: SOC[0.1, 0.9], Discharge Only, Extract T/V/I
-    """
     I_raw = np.abs(cycle_data['data']['current_measured'])
     V_raw = cycle_data['data']['voltage_measured']
     t_raw = cycle_data['data']['time']
@@ -19,12 +17,11 @@ def get_clean_data_from_cycle(cycle_data, cycle_id):
          T_raw = cycle_data['data']['temperature_measured']
          
     Q = cycle_data['data']['capacity']
-    
-    # 1. 计算 SOC
     soc_raw = cul_SOC(I_raw, t_raw, Q)
     
-    # 2. 筛选掩码: 放电且 SOC 在有效区间
-    mask = (I_raw > 0.05) & (soc_raw >= 0.1) & (soc_raw <= 0.9)
+    # 筛选: 放电 (I>0.05) 且 SOC [0.1, 0.95]
+    # 稍微放宽一点上限，看能不能拟合得更好
+    mask = (I_raw > 0.05) & (soc_raw >= 0.0) & (soc_raw <= 0.9)
     
     clean_data = {
         'cycle_id': cycle_id,
@@ -37,21 +34,19 @@ def get_clean_data_from_cycle(cycle_data, cycle_id):
     return clean_data
 
 def main():
-    # === 1. 定义数据源 ===
-    # 建议尽量混合不同温度或不同电池的数据以增加鲁棒性
+    # 使用 B0038 数据 (正如你图中所示)
     sources = [
-        {'file': '../Battery Data Set/1/B0005.mat', 'cycle_idx': 22}, 
-        {'file': '../Battery Data Set/1/B0005.mat', 'cycle_idx': 50}, # 增加一个老化程度不同的
-        {'file': '../Battery Data Set/1/B0006.mat', 'cycle_idx': 20}, 
-    ] 
+        {'file': '../Battery Data Set/3/B0038.mat', 'cycle_idx': 1}, 
+        {'file': '../Battery Data Set/3/B0038.mat', 'cycle_idx': 37},
+        {'file': '../Battery Data Set/3/B0038.mat', 'cycle_idx': 13}, 
+    ]
     
     loaded_files = {}
-    combined_I, combined_V, combined_T, combined_OCV = [], [], [], []
+    combined_data = {'I': [], 'V': [], 'T': [], 'OCV': [], 'SOC': []}
     validation_list = [] 
     
     print(">>> 正在加载并清洗数据...")
     
-    # === 2. 读取与清洗 ===
     for src in sources:
         fpath = src['file']
         c_idx = src['cycle_idx']
@@ -60,99 +55,99 @@ def main():
             try:
                 loaded_files[fpath] = load_battery_data(fpath)
             except Exception as e:
-                print(f"    [Error] 无法读取 {fpath}: {e}")
+                print(f"    [Error] Skip {fpath}: {e}")
                 continue
         
         all_cycles = loaded_files[fpath]
         discharge_cycles = [c for c in all_cycles if c['type'] == 'discharge']
         
         if c_idx >= len(discharge_cycles): continue
-            
         target = discharge_cycles[c_idx]
-        clean = get_clean_data_from_cycle(target, target['cycle_id'])
         
+        clean = get_clean_data_from_cycle(target, target['cycle_id'])
         if len(clean['V']) == 0: continue
             
-        # 计算 OCV
         ocv_segment = get_OCV(clean['SOC'])
-        clean['OCV'] = ocv_segment 
+        clean['OCV'] = ocv_segment
         
-        combined_I.append(clean['I'])
-        combined_V.append(clean['V'])
-        combined_T.append(clean['T'])
-        combined_OCV.append(ocv_segment)
+        combined_data['I'].append(clean['I'])
+        combined_data['V'].append(clean['V'])
+        combined_data['T'].append(clean['T'])
+        combined_data['OCV'].append(ocv_segment)
+        combined_data['SOC'].append(clean['SOC'])
+        
         validation_list.append(clean)
 
-    if not combined_V: return
+    if not combined_data['V']: return
 
-    train_I = np.concatenate(combined_I)
-    train_V = np.concatenate(combined_V)
-    train_T = np.concatenate(combined_T)
-    train_OCV = np.concatenate(combined_OCV)
+    # 拼接
+    train_I = np.concatenate(combined_data['I'])
+    train_V = np.concatenate(combined_data['V'])
+    train_T = np.concatenate(combined_data['T'])
+    train_OCV = np.concatenate(combined_data['OCV'])
+    train_SOC = np.concatenate(combined_data['SOC'])
     
     print(f"\n>>> 训练数据: {len(train_V)} 点")
+    print(f"    电流均值: {np.mean(train_I):.2f} A")
     
-    # === 3. 约束拟合 (核心修改部分) ===
-    x_data = (train_I, train_OCV, train_T)
+    # === 拟合参数 ===
+    x_data = (train_I, train_OCV, train_T, train_SOC)
     
-    # --- 设置强约束 ---
-    # R_base: 0.0 ~ 1.0 欧姆 (通常 18650 在 0.02-0.1 之间)
-    # I0:     0.1 ~ 2.0 A (强制限定在经验范围内)
+    # 待拟合参数: [R_base, k_low_soc]
+    # R_base: 基础内阻，大概 0.05 - 0.2 之间
+    # k_low_soc: 低电量内阻增加系数，通常很小
+    p0 = [0.1, 0.01]
+    bounds = ([0.0, 0.0], [1.0, 1.0])
     
-    # lower_bounds = [R_min, I0_min]
-    lower_bounds = [0.0, 0.01]
-    # upper_bounds = [R_max, I0_max]
-    upper_bounds = [1.0, 2.0]
-    
-    bounds = (lower_bounds, upper_bounds)
-    
-    # 初始猜测 (确保在 Bounds 内部)
-    p0 = [0.1, 0.5] 
-    
-    print("\n>>> 开始拟合参数 (R_base, I0)...")
-    print(f"    约束范围: I0 ∈ [{lower_bounds[1]}, {upper_bounds[1]}] A")
-    
+    print("\n>>> 开始拟合参数 (R_base, k_low_soc)...")
     try:
         popt, pcov = curve_fit(total_voltage_model, x_data, train_V, p0=p0, bounds=bounds)
-        R_base_fit, I0_fit = popt
+        R_base_fit, k_fit = popt
         
         print(f"Fit Success!")
-        print(f"  R_base (25C) = {R_base_fit:.6f} Ohm")
-        print(f"  I0           = {I0_fit:.6f} A")
-        
-        # 检查边界触碰
-        if np.isclose(I0_fit, lower_bounds[1]) or np.isclose(I0_fit, upper_bounds[1]):
-            print("  [警告] I0 触碰到了边界值！这说明数据可能无法有效区分 Tafel 项。")
-            print("         模型可能将 I0 当作一个纯粹的截距调整参数。")
-            
+        print(f"  R_base    = {R_base_fit:.6f} Ohm")
+        print(f"  k_low_soc = {k_fit:.6f} Ohm (低SOC影响系数)")
     except Exception as e:
         print(f"拟合失败: {e}")
         return
 
-    # === 4. 验证画图 ===
+    # === 可视化 ===
     print("\n>>> 生成验证图...")
     num_plots = len(validation_list)
     plt.figure(figsize=(10, 4 * num_plots))
     
     for i, data in enumerate(validation_list):
         plt.subplot(num_plots, 1, i+1)
-        seg_inputs = (data['I'], data['OCV'], data['T'])
-        V_seg_pred = total_voltage_model(seg_inputs, R_base_fit, I0_fit)
-        seg_rmse = np.sqrt(np.mean((data['V'] - V_seg_pred)**2))
+        
+        seg_inputs = (data['I'], data['OCV'], data['T'], data['SOC'])
+        V_pred = total_voltage_model(seg_inputs, R_base_fit, k_fit)
+        rmse = np.sqrt(np.mean((data['V'] - V_pred)**2))
+        
+        # 计算内阻分量用于展示
+        temp_corr = np.exp((31930.0 / 8.3145) * (1.0/(data['T']+273.15) - 1.0/298.15))
+        
+        # 基础压降 (Base Ohmic)
+        V_drop_base = data['I'] * R_base_fit * temp_corr
+        # 极化压降 (Low SOC effect)
+        V_drop_soc = data['I'] * (k_fit * (1.0/data['SOC'] - 1.0)) * temp_corr
         
         plt.plot(data['SOC'], data['V'], 'k-', label='Measured', linewidth=1.5)
-        plt.plot(data['SOC'], V_seg_pred, 'r--', label=f'Model (RMSE={seg_rmse:.4f})', linewidth=1.5)
-        # 增加显示 OCV-IR (纯电阻压降) 以展示 Tafel 的贡献
-        # 纯电阻电压 = OCV - I*R(T)
-        R_T = R_base_fit * np.exp((31930.0 / 8.3145) * (1.0/(data['T']+273.15) - 1.0/298.15))
-        V_ohm_only = data['OCV'] - data['I'] * R_T
-        plt.plot(data['SOC'], V_ohm_only, 'b:', label='OCV - IR (No Tafel)', alpha=0.4)
-
+        plt.plot(data['SOC'], V_pred, 'r--', label=f'Model (RMSE={rmse:.3f})', linewidth=1.5)
+        
+        # 绘制 OCV
+        plt.plot(data['SOC'], data['OCV'], 'g:', label='OCV', alpha=0.4)
+        
+        # 堆叠填充图
+        plt.fill_between(data['SOC'], data['OCV'], data['OCV'] - V_drop_base, 
+                         color='blue', alpha=0.1, label='Base Resistance Drop')
+        plt.fill_between(data['SOC'], data['OCV'] - V_drop_base, V_pred, 
+                         color='orange', alpha=0.2, label='Low-SOC Polarization')
+        
         plt.gca().invert_xaxis()
-        plt.title(f"Cycle {data['cycle_id']} (RMSE={seg_rmse:.4f}V)")
+        plt.title(f"Cycle {data['cycle_id']} - I_avg={np.mean(data['I']):.1f}A")
         plt.xlabel('SOC')
         plt.ylabel('Voltage (V)')
-        plt.legend()
+        plt.legend(loc='lower left')
         plt.grid(True, linestyle='--', alpha=0.5)
 
     plt.tight_layout()

@@ -1,92 +1,59 @@
 import numpy as np
 from scipy.integrate import cumulative_trapezoid
 
-# === 物理常数定义 ===
-FARADAY = 96485.3       # 法拉第常数 (C/mol)
-R_GAS = 8.3145          # 气体常数 (J/(mol·K))
-
-# === 题目/截图提供的模型参数 (Page 2) ===
-# Ea = 31.93 kJ/mol = 31930 J/mol
+# === 常数定义 ===
+FARADAY = 96485.3       
+R_GAS = 8.3145          
 E_ACTIVATION = 31930.0  
-# T_ref = 25 degC = 298.15 K
 T_REF = 298.15          
 
 def cul_SOC(I, t, capacity_Ah):
-    """
-    根据安时积分法计算放电过程中的 SOC 序列。
-    公式: SOC(t) = SOC(0) - (1/Q) * ∫ I(τ) dτ
-    
-    参数:
-        I (np.array): 电流序列 (A)。
-        t (np.array): 时间序列 (s)。
-        capacity_Ah (float): 当前循环的总容量 (Ah)。
-    """
-    # 计算电流对时间的累积积分 (单位: A*s)
-    # initial=0 保证输出长度与输入一致
+    """ 安时积分法 """
     discharged_charge_As = cumulative_trapezoid(I, t, initial=0)
-    
-    # 单位换算: A*s -> A*h
     discharged_charge_Ah = discharged_charge_As / 3600.0
-    
-    # 假设放电开始时为满电 (1.0)
     soc = 1.0 - (discharged_charge_Ah / capacity_Ah)
-    
-    # 限制在 [0, 1] 范围内
-    return np.clip(soc, 0, 1)
+    # 限制 SOC 不小于 0.01，防止 1/SOC 计算时除以零
+    return np.clip(soc, 0.01, 1)
 
 def get_OCV(soc):
-    """
-    使用截图中的八次多项式拟合模型计算开路电压 (OCV)。
-    OCV(SOC) = k0 + k1*SOC + k2*SOC^2 + ... + k8*SOC^8
-    """
+    """ OCV 模型 """
     return (3.5+(4.0-3.5)*soc)
-    # return (2.85 + 4.80*soc - 17.8*soc**2 + 38.59*soc**3 + 4.91*soc**4
-    #          - 210.52*soc**5 + 433.98*soc**6 - 368.45*soc**7 + 115.81*soc**8)
+    return (2.85 + 4.80*soc - 17.8*soc**2 + 38.59*soc**3 + 4.91*soc**4
+             - 210.52*soc**5 + 433.98*soc**6 - 368.45*soc**7 + 115.81*soc**8)
 
-def total_voltage_model(inputs, R_base, I0):
+def total_voltage_model(inputs, R_base, k_low_soc):
     """
-    综合电压模型 (用于参数拟合)。
+    自适应内阻模型
     
-    公式: V(t) = OCV(SOC) - I(t)*R_int(T) - Up(I, T)
+    公式: V = OCV - I * R_total(SOC, T)
     
-    其中:
-    1. R_int(T) 使用 Arrhenius 模型:
-       R_int(T) = R_base * exp( (Ea/R) * (1/T - 1/T_ref) )
-       (此处 R_base 即为参考温度 T_ref 下的内阻)
-       
-    2. Up 使用 Tafel 公式 (Butler-Volmer 在高电位下的简化):
-       Up = (2*R*T/F) * arcsinh( I / (2*I0) )
+    其中 R_total = (R_base + k_low_soc / SOC) * Arrhenius(T)
     
     参数:
-        inputs: tuple (I, OCV_val, T_celsius)
-        R_base: 待拟合参数，参考温度下的欧姆内阻 (Ohm)
-        I0:     待拟合参数，交换电流 (A)
-        
-    返回:
-        V_pred: 预测的端电压序列 (V)
+      R_base:    基础欧姆内阻 (Ohm)
+      k_low_soc: 低SOC区域的阻抗上升系数 (Ohm)
     """
-    I, OCV_val, T_celsius = inputs
+    I, OCV_val, T_celsius, SOC_val = inputs
     
-    # 转换温度为开尔文
     T_kelvin = T_celsius + 273.15
     
-    # --- 1. 计算受温度影响的欧姆内阻 ---
-    # exponent = (Ea / R) * (1/T - 1/T_ref)
-    exponent = (E_ACTIVATION / R_GAS) * (1.0 / T_kelvin - 1.0 / T_REF)
-    R_int_T = R_base * np.exp(exponent)
+    # 1. 计算温度修正系数 (Arrhenius)
+    temp_correction = np.exp((E_ACTIVATION / R_GAS) * (1.0/T_kelvin - 1.0/T_REF))
     
-    # 欧姆压降
-    U_ohm = I * R_int_T
+    # 2. 计算与 SOC 相关的总内阻
+    #    模型假设：电阻由基础值 + 低电量时的极化增加值组成
+    #    使用 0.1/SOC 是为了让系数 k 的量级在数学上更可控，或者直接用 1/SOC
+    #    这里使用简单的 R = R_base + k * (1/SOC - 1) 
+    #    (当 SOC=1时 R=R_base; 当 SOC->0时 R增加)
     
-    # --- 2. 计算极化电压 Up (Tafel) ---
-    # 系数 A = 2RT / F
-    coeff = (2 * R_GAS * T_kelvin) / FARADAY
+    # 也就是 R_soc = R_base + k_low_soc * (1.0/SOC_val - 1.0)
+    # 这样定义 k_low_soc 物理意义更明确：SOC越低，增加的电阻越多
+    R_soc_part = R_base + k_low_soc * (1.0/SOC_val - 1.0)
     
-    # 使用 arcsinh 计算极化压降。
-    # 加一个极小的 offset (1e-12) 防止 I0 被拟合到 0 时发生除零错误
-    U_p = coeff * np.arcsinh(I / (2 * I0 + 1e-12))
+    # 3. 综合内阻
+    R_total = R_soc_part * temp_correction
     
-    # --- 3. 计算端电压 ---
-    V_pred = OCV_val - U_ohm - U_p
+    # 4. 计算电压
+    V_pred = OCV_val - I * R_total
     
     return V_pred

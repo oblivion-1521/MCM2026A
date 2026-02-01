@@ -4,6 +4,8 @@ from scipy.integrate import cumulative_trapezoid
 # 常数定义
 FARADAY = 96485.3  # 法拉第常数 (C/mol)
 R_GAS = 8.3145    # 气体常数 (J/(mol·K))
+E_ACTIVATION = 31930  
+T_REF = 298.15  # 参考温度 (K)
 
 def cul_SOC(I, t, capacity_Ah):
     """
@@ -66,3 +68,45 @@ def get_thermal_voltage(T_celsius):
     T_kelvin = T_celsius + 273.15
     # 返回 RT/F 的值
     return (R_GAS * T_kelvin) / FARADAY
+def total_voltage_model(inputs, R_base, I0):
+    """
+    包含 Arrhenius 温度修正的总电压模型。
+    
+    公式: 
+    1. R_int(T) = R_base * exp( (Ea/R) * (1/T - 1/T_ref) )
+    2. V(t) = OCV(SOC) - I(t)*R_int(T) - (2RT/F)*arcsinh(I(t)/(2*I0))
+    
+    参数:
+        inputs: tuple (I, OCV, T_celsius)
+            - I: 电流 (A)
+            - OCV: 开路电压 (V)
+            - T_celsius: 电池实际温度 (℃) **注意这里必须是随时间变化的数组**
+        R_base: 待拟合参数，参考温度下的内阻 (Ohm)
+        I0: 待拟合参数，交换电流 (A)
+    """
+    I, OCV_val, T_celsius = inputs
+    
+    # 转换温度为开尔文
+    T_kelvin = T_celsius + 273.15
+    
+    # --- 1. 计算随温度变化的内阻 (Arrhenius Equation) ---
+    # 指数项: (Ea / R) * (1/T - 1/T_ref)
+    arrhenius_term = (E_ACTIVATION / R_GAS) * (1.0 / T_kelvin - 1.0 / T_REF)
+    
+    # 当前温度下的内阻
+    R_T = R_base * np.exp(arrhenius_term)
+    
+    # 欧姆压降
+    U_ohm = I * R_T
+    
+    # --- 2. 计算极化电压 (Tafel / Butler-Volmer 简化) ---
+    # 系数 2RT/F
+    tafel_coeff = (2.0 * R_GAS * T_kelvin) / FARADAY
+    
+    # 防止 I0 为 0 导致除法错误
+    U_p = tafel_coeff * np.arcsinh(I / (2.0 * I0 + 1e-12))
+    
+    # --- 3. 总电压 ---
+    V_pred = OCV_val - U_ohm - U_p
+    
+    return V_pred

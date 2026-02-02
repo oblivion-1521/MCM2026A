@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.integrate import cumulative_trapezoid
+from numba import njit, prange
 
 # === 常数定义 ===
 FARADAY = 96485.3       
@@ -144,28 +145,15 @@ def solve_current_from_power(P, OCV, R_total):
     
     return I
 
-def simulate_power_depletion(
+@njit(cache=True)
+def _simulate_power_depletion_core(
     time_arr, P_arr, 
     initial_soc, initial_temp, T_env, capacity_Ah,
     R_base, k_low_soc, mCp, c,
-    V_cutoff=3.0
+    V_cutoff
 ):
     """
-    全过程仿真：给定功率曲线 P(t)，模拟直到耗尽
-    
-    参数:
-        time_arr: 时间数组 (s)
-        P_arr: 对应的功率数组 (W)
-        initial_soc: 初始 SOC (0~1)
-        initial_temp: 初始电池温度 (C)
-        T_env: 环境温度 (C)
-        capacity_Ah: 电池容量
-        R_base, k_low_soc: 内阻模型参数
-        mCp, c: 热模型参数
-        V_cutoff: 截止电压
-        
-    返回:
-        results (dict): 包含 t, I, V, SOC, T 的数组
+    Numba JIT 加速的核心仿真循环
     """
     N = len(time_arr)
     
@@ -183,20 +171,36 @@ def simulate_power_depletion(
     end_idx = N
     
     for i in range(N):
-        t_curr = time_arr[i]
         P_curr = P_arr[i]
         
-        # 1. 计算当前时刻的 OCV 和 内阻
-        curr_OCV = get_OCV(curr_SOC)
-        curr_R = get_internal_resistance(curr_T, curr_SOC, R_base, k_low_soc)
+        # 1. 计算当前时刻的 OCV 和 内阻 (内联计算避免函数调用开销)
+        curr_OCV = 3.4 + 0.6 * curr_SOC
         
-        # 2. 求解电流 I
-        I_val = solve_current_from_power(P_curr, curr_OCV, curr_R)
+        # 内阻计算 (内联)
+        T_kelvin = curr_T + 273.15
+        temp_correction = np.exp((E_ACTIVATION / R_GAS) * (1.0/T_kelvin - 1.0/T_REF))
+        R_soc_part = R_base + k_low_soc * (1.0/curr_SOC - 1.0)
+        curr_R = R_soc_part * temp_correction
         
-        if I_val is None:
-            print(f"Simulation stopped at t={t_curr:.1f}s: Power too high for battery state.")
-            end_idx = i
-            break
+        # 2. 求解电流 I (内联)
+        if P_curr <= 1e-6:
+            I_val = 0.0
+        else:
+            # 效率计算 (内联)
+            denom = ETA_A * (P_curr**2) + (1 + ETA_B) * P_curr + ETA_C
+            eta = P_curr / denom
+            
+            # 二次方程求解
+            A = eta * curr_R
+            B = -eta * curr_OCV
+            C = P_curr
+            delta = B**2 - 4 * A * C
+            
+            if delta < 0:
+                end_idx = i
+                break
+            
+            I_val = (-B - np.sqrt(delta)) / (2 * A)
             
         # 3. 计算端电压 V
         V_val = curr_OCV - I_val * curr_R
@@ -208,8 +212,7 @@ def simulate_power_depletion(
         res_T[i] = curr_T
         
         # 5. 检查截止条件
-        if V_val <= V_cutoff or curr_SOC <= 0.05: # 留一点余量防止除零
-            # print(f"Simulation stopped at t={t_curr:.1f}s: Cutoff reached (V={V_val:.2f}, SOC={curr_SOC:.2f})")
+        if V_val <= V_cutoff or curr_SOC <= 0.05:
             end_idx = i + 1
             break
             
@@ -217,18 +220,54 @@ def simulate_power_depletion(
         if i < N - 1:
             dt = time_arr[i+1] - time_arr[i]
             
-            # 更新 SOC (安时积分)
-            # capacity_Ah * 3600 = Total Coulombs
-            # dSOC = - I * dt / Total_Coulombs
+            # 更新 SOC
             dSOC = - I_val * dt / (capacity_Ah * 3600.0)
             curr_SOC = curr_SOC + dSOC
             
-            # 更新 温度 (欧拉法)
-            # dT = (P_heat - P_cool) / mCp * dt
+            # 更新 温度
             P_heat = (I_val ** 2) * curr_R
             P_cool = c * (curr_T - T_env)
             dT = (P_heat - P_cool) / mCp * dt
             curr_T = curr_T + dT
+
+    return res_I, res_V, res_SOC, res_T, end_idx
+
+
+def simulate_power_depletion(
+    time_arr, P_arr, 
+    initial_soc, initial_temp, T_env, capacity_Ah,
+    R_base, k_low_soc, mCp, c,
+    V_cutoff=3.0
+):
+    """
+    全过程仿真：给定功率曲线 P(t)，模拟直到耗尽
+    使用 Numba JIT 加速的核心循环
+    
+    参数:
+        time_arr: 时间数组 (s)
+        P_arr: 对应的功率数组 (W)
+        initial_soc: 初始 SOC (0~1)
+        initial_temp: 初始电池温度 (C)
+        T_env: 环境温度 (C)
+        capacity_Ah: 电池容量
+        R_base, k_low_soc: 内阻模型参数
+        mCp, c: 热模型参数
+        V_cutoff: 截止电压
+        
+    返回:
+        results (dict): 包含 t, I, V, SOC, T 的数组
+    """
+    # 确保输入是 numpy 数组
+    time_arr = np.ascontiguousarray(time_arr, dtype=np.float64)
+    P_arr = np.ascontiguousarray(P_arr, dtype=np.float64)
+    
+    # 调用 JIT 编译的核心函数
+    res_I, res_V, res_SOC, res_T, end_idx = _simulate_power_depletion_core(
+        time_arr, P_arr, 
+        initial_soc, initial_temp, T_env, capacity_Ah,
+        R_base, k_low_soc, mCp, c,
+        V_cutoff
+    )
 
     # 截断数组返回有效部分
     return {

@@ -14,7 +14,8 @@ from battery_physics import (
 # 引入新的功率计算模块
 from Power_options import read_and_compute_power
 from aging import simulate_power_depletion_with_aging
-from visualization import plot_power_depletion_simulation, plot_aging_comparison
+from visualization import plot_power_depletion_simulation, plot_aging_comparison, plot_time_uncertainty
+from time_uncertainty import analyze_time_uncertainty, get_runtime_bounds
 
 def get_clean_data_from_cycle(cycle_data, cycle_id):
     I_raw = np.abs(cycle_data['data']['current_measured'])
@@ -65,7 +66,9 @@ def thermal_fit_wrapper(packed_inputs, mCp, c):
     return np.concatenate(all_preds)
 
 
-def main(device_id='DEV_0013', capacity_sim=3.497, aging=False, lambda_aging=0.2, D_aging=0.0):
+def main(device_id='DEV_0013', capacity_sim=3.497, phone_model='Unknown',
+         aging=False, lambda_aging=0.2, D_aging=0.0,
+         time_uncertainty=False, P_min=0.3, P_max=1.5):
     # ==========================================
     # Step 1: 加载 NASA 电池数据 (用于训练参数)
     # ==========================================
@@ -231,18 +234,41 @@ def main(device_id='DEV_0013', capacity_sim=3.497, aging=False, lambda_aging=0.2
     # ==========================================
     # Step 5: 结果可视化
     # ==========================================
-    print("\n>>> [Step 5] Generating Visualizations...")
+    print(f"\n>>> [Step 5] Generating Visualizations for {phone_model}...")
     
     plot_power_depletion_simulation(
         sim_result, t_source_sec, P_source_watts,
-        capacity_sim, T_env_sim, V_cutoff_sim
+        capacity_sim, T_env_sim, V_cutoff_sim,
+        phone_model=phone_model
     )
 
     # ==========================================
-    # Step 6: 老化电池仿真 (可选)
+    # Step 6: 时间不确定性分析 (可选)
+    # ==========================================
+    if time_uncertainty:
+        print(f"\n>>> [Step 6] Running Time Uncertainty Analysis for {phone_model}...")
+        print(f"    Power range: {P_min*1000:.0f} mW ~ {P_max*1000:.0f} mW")
+        
+        uncertainty_results = analyze_time_uncertainty(
+            P_min, P_max,
+            SOC_init_sim, T_init_sim, T_env_sim, capacity_sim,
+            R_base_fit, k_fit, mCp_fit, c_fit,
+            V_cutoff=V_cutoff_sim,
+            dt=1.0,
+            n_levels=5
+        )
+        
+        plot_time_uncertainty(uncertainty_results, capacity_sim, phone_model=phone_model)
+        
+        # 获取续航时间边界
+        t_min, t_max, t_avg = get_runtime_bounds(uncertainty_results)
+        print(f"    Runtime bounds: {t_min:.2f}h ~ {t_max:.2f}h (avg: {t_avg:.2f}h)")
+
+    # ==========================================
+    # Step 7: 老化电池仿真 (可选)
     # ==========================================
     if aging:
-        print(f"\n>>> [Step 6] Running Aging Simulation (λ={lambda_aging})...")
+        print(f"\n>>> [Step 7] Running Aging Simulation for {phone_model} (λ={lambda_aging})...")
         print(f"    Internal resistance increase: {lambda_aging*100:.1f}%")
         print(f"    Capacity degradation: {D_aging*100:.1f}% (C_eff = {capacity_sim*(1-D_aging):.3f} Ah)")
 
@@ -255,12 +281,37 @@ def main(device_id='DEV_0013', capacity_sim=3.497, aging=False, lambda_aging=0.2
             V_cutoff=V_cutoff_sim
         )
         
-        plot_aging_comparison(sim_result, sim_result_aging, lambda_aging, D_aging, V_cutoff_sim)
+        plot_aging_comparison(sim_result, sim_result_aging, lambda_aging, D_aging, V_cutoff_sim, 
+                              phone_model=phone_model)
 
 if __name__ == "__main__":
-    device_id = 'DEV_0030'  # 可以修改为其他设备ID
+    # ==========================================
+    # 手机型号核心参数
+    # ==========================================
+    # iPhone 13: device_id='DEV_0013', capacity=3.497 Ah
+    # iPhone 12: device_id='DEV_0030', capacity=3.951 Ah (2815 mAh typical)
+    
+    # 选择手机型号
+    phone_model = 'iPhone 12'
+    device_id = 'DEV_0030'
     capacity_sim = 3.951
-    # 截止电压为 3V
-    # aging=True 开启老化仿真，lambda_aging 为老化系数(内阻增加比例)
-    main(device_id=device_id, capacity_sim=capacity_sim, aging=True, lambda_aging=1.5, D_aging=0.2)
+    
+    # 功率范围 (用于时间不确定性分析)
+    P_min = 0.3   # 最小功率 300 mW (待机/轻负载)
+    P_max = 2.0   # 最大功率 2000 mW (高负载)
+    
+    # 运行仿真
+    # aging=True 开启老化仿真，lambda_aging 为内阻增加比例，D_aging 为容量衰减比例
+    # time_uncertainty=True 开启时间不确定性分析
+    main(
+        device_id=device_id, 
+        capacity_sim=capacity_sim, 
+        phone_model=phone_model,
+        aging=True, 
+        lambda_aging=1.5, 
+        D_aging=0.2,
+        time_uncertainty=True,
+        P_min=P_min,
+        P_max=P_max
+    )
 # %%

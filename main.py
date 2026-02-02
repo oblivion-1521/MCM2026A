@@ -13,6 +13,7 @@ from battery_physics import (
 )
 # 引入新的功率计算模块
 from Power_options import read_and_compute_power
+from aging import simulate_power_depletion_with_aging, plot_aging_comparison
 
 def get_clean_data_from_cycle(cycle_data, cycle_id):
     I_raw = np.abs(cycle_data['data']['current_measured'])
@@ -63,7 +64,7 @@ def thermal_fit_wrapper(packed_inputs, mCp, c):
     return np.concatenate(all_preds)
 
 
-def main(device_id='DEV_0013', capacity_sim=3.497):
+def main(device_id='DEV_0013', capacity_sim=3.497, aging=False, lambda_aging=0.2):
     # ==========================================
     # Step 1: 加载 NASA 电池数据 (用于训练参数)
     # ==========================================
@@ -203,9 +204,10 @@ def main(device_id='DEV_0013', capacity_sim=3.497):
     # 阶跃插值生成 P(t)
     # 使用阶跃插值（零阶保持），假设两个日志点之间功率保持不变
     # kind='zero' 或 'previous' 表示取前一个点的值
-    interp_func = interp1d(t_source_sec, P_source_watts, kind='zero', 
-                           bounds_error=False, fill_value=(P_source_watts[0], P_source_watts[-1]))
-    P_sim = interp_func(t_sim)
+    P_sim = np.interp(t_sim, t_source_sec, P_source_watts)
+    # interp_func = interp1d(t_source_sec, P_source_watts, kind='zero', 
+    #                        bounds_error=False, fill_value=(P_source_watts[0], P_source_watts[-1]))
+    # P_sim = interp_func(t_sim)
 
 
     
@@ -303,8 +305,26 @@ def main(device_id='DEV_0013', capacity_sim=3.497):
     print(f"Total simulated time: {t_end:.1f} s ({duration_hrs:.2f} hours)")
     print(f"Final SOC: {sim_result['SOC'][-1]*100:.2f} %") 
 
+    # ==========================================
+    # Step 6: 老化电池仿真 (可选)
+    # ==========================================
+    if aging:
+        print(f"\n>>> [Step 6] Running Aging Simulation (λ={lambda_aging})...")
+        
+        sim_result_aging = simulate_power_depletion_with_aging(
+            t_sim, P_sim,
+            SOC_init_sim, T_init_sim, T_env_sim, capacity_sim,
+            R_base_fit, k_fit, mCp_fit, c_fit,
+            lambda_aging=lambda_aging,
+            V_cutoff=V_cutoff_sim
+        )
+        
+        plot_aging_comparison(sim_result, sim_result_aging, lambda_aging, V_cutoff_sim)
+
 if __name__ == "__main__":
     device_id = 'DEV_0030'  # 可以修改为其他设备ID
     capacity_sim = 3.951
-    main(device_id=device_id, capacity_sim=capacity_sim)
+    # 截止电压为 3V
+    # aging=True 开启老化仿真，lambda_aging 为老化系数(内阻增加比例)
+    main(device_id=device_id, capacity_sim=capacity_sim, aging=True, lambda_aging=4.2)
 # %%

@@ -58,7 +58,7 @@ def single_simulation(args):
             'R_base': sim_R_base,
             'c': sim_c,
             'T_env': sim_T_env,
-            'P_scale': sim_P_scale
+            'P': sim_P_scale
         }
     }
 
@@ -81,12 +81,12 @@ def run_sensitivity_analysis(N_simulations=500):
     # 基准参数 (来自 main.py 的拟合结果，这里手动填入示例值，实际应用你之前拟合的值)
     params_base = {
         'capacity': 3.951,
-        'R_base': 0.1,    # 假设值，请替换为你 fit 出的值
-        'k_low_soc': 0.01,
-        'mCp': 45.0,
-        'c': 0.04,
-        'T_env': 25.0,
-        'P_scale': 1.0    # 功率缩放因子基准
+        'R_base': 0.28626,    # 假设值，请替换为你 fit 出的值
+        'k_low_soc': 0.003092,
+        'mCp': 94.0829,
+        'c': 0.0492,
+        'T_env': 24.0,
+        'P': 1.0    # 功率缩放因子基准
     }
 
     # 获取CPU线程数

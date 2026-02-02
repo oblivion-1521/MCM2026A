@@ -228,50 +228,81 @@ def plot_monte_carlo_results(runtimes, df_inputs, N_simulations):
     
     runtimes = np.array(runtimes)
     
-    plt.figure(figsize=(14, 6))
+    # 增加图片尺寸，给右侧图更多空间
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6), gridspec_kw={'width_ratios': [1.2, 1]})
     
-    # 1. 续航时间分布直方图 - 使用更细的 bin
-    plt.subplot(1, 2, 1)
+    # 1. 续航时间分布直方图
+    ax1 = axes[0]
     
-    # 根据数据范围自动计算 bin 数量 (约每 0.05 小时一个 bin)
+    # 根据数据范围自动计算 bin 数量
     data_range = np.max(runtimes) - np.min(runtimes)
-    n_bins = max(50, int(data_range / 0.2))  # 至少 50 个 bin，或更多
+    n_bins = max(50, int(data_range / 0.2))
     
-    plt.hist(runtimes, bins=n_bins, color='skyblue', edgecolor='black', alpha=0.7, linewidth=0.5)
-    plt.axvline(np.mean(runtimes), color='red', linestyle='--', linewidth=2, label=f'Mean: {np.mean(runtimes):.2f}h')
-    plt.axvline(np.percentile(runtimes, 2.5), color='orange', linestyle=':', linewidth=1.5, label=f'2.5%: {np.percentile(runtimes, 2.5):.2f}h')
-    plt.axvline(np.percentile(runtimes, 97.5), color='orange', linestyle=':', linewidth=1.5, label=f'97.5%: {np.percentile(runtimes, 97.5):.2f}h')
+    ax1.hist(runtimes, bins=n_bins, color='skyblue', edgecolor='black', alpha=0.7, linewidth=0.5)
+    ax1.axvline(np.mean(runtimes), color='red', linestyle='--', linewidth=2, label=f'Mean: {np.mean(runtimes):.2f}h')
+    ax1.axvline(np.percentile(runtimes, 2.5), color='orange', linestyle=':', linewidth=1.5, label=f'2.5%: {np.percentile(runtimes, 2.5):.2f}h')
+    ax1.axvline(np.percentile(runtimes, 97.5), color='orange', linestyle=':', linewidth=1.5, label=f'97.5%: {np.percentile(runtimes, 97.5):.2f}h')
     
-    plt.xlabel('Runtime (Hours)', fontsize=12)
-    plt.ylabel('Frequency', fontsize=12)
-    plt.title(f'Monte Carlo Analysis: Battery Runtime Distribution\n(N = {N_simulations:,} simulations)', fontsize=13)
-    plt.legend(loc='upper right')
-    plt.grid(True, alpha=0.3)
+    ax1.set_xlabel('Runtime (Hours)', fontsize=12)
+    ax1.set_ylabel('Frequency', fontsize=12)
+    ax1.set_title(f'Monte Carlo Analysis: Battery Runtime Distribution\n(N = {N_simulations:,} simulations)', fontsize=13)
+    ax1.legend(loc='upper left', fontsize=10)
+    ax1.grid(True, alpha=0.3)
     
-    # 添加统计信息文本框
+    # 添加统计信息文本框 - 放在右上角
     stats_text = f'Mean: {np.mean(runtimes):.3f}h\nStd: {np.std(runtimes):.3f}h\n95% CI: [{np.percentile(runtimes, 2.5):.3f}, {np.percentile(runtimes, 97.5):.3f}]h'
-    plt.text(0.02, 0.98, stats_text, transform=plt.gca().transAxes, fontsize=10,
-             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    ax1.text(0.98, 0.98, stats_text, transform=ax1.transAxes, fontsize=10,
+             verticalalignment='top', horizontalalignment='right',
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
     
     # 2. 龙卷风图 (Tornado Plot) - 相关性系数
-    plt.subplot(1, 2, 2)
+    ax2 = axes[1]
     correlations = df_inputs.corrwith(pd.Series(runtimes))
     correlations_sorted = correlations.sort_values()
     
-    colors = ['salmon' if x < 0 else 'steelblue' for x in correlations_sorted]
-    bars = plt.barh(correlations_sorted.index, correlations_sorted.values, color=colors, alpha=0.7, edgecolor='black')
+    # 更美观的颜色
+    colors = ['#E57373' if x < 0 else '#64B5F6' for x in correlations_sorted]
+    bars = ax2.barh(correlations_sorted.index, correlations_sorted.values, 
+                    color=colors, alpha=0.85, edgecolor='black', height=0.6)
     
-    plt.title(f'Sensitivity Analysis: Correlation with Runtime\n(N = {N_simulations:,} simulations)', fontsize=13)
-    plt.xlabel('Pearson Correlation Coefficient', fontsize=12)
-    plt.axvline(0, color='black', linewidth=0.8)
-    plt.grid(True, alpha=0.3, axis='x')
+    ax2.set_title(f'Sensitivity Analysis: Correlation with Runtime\n(N = {N_simulations:,} simulations)', fontsize=13)
+    ax2.set_xlabel('Pearson Correlation Coefficient', fontsize=12)
+    ax2.axvline(0, color='black', linewidth=0.8)
+    ax2.grid(True, alpha=0.3, axis='x')
     
-    # 在条形图上添加数值标签
+    # 设置 x 轴范围
+    x_min = min(correlations_sorted.values.min() * 1.1, -0.15)
+    x_max = max(correlations_sorted.values.max() * 1.3, 0.25)
+    ax2.set_xlim(x_min, x_max)
+    
+    # 在条形图上添加数值标签 - 放在条形内部或紧贴末端
     for bar, val in zip(bars, correlations_sorted.values):
-        plt.text(val + 0.01 if val >= 0 else val - 0.01, bar.get_y() + bar.get_height()/2,
-                 f'{val:.3f}', va='center', ha='left' if val >= 0 else 'right', fontsize=9)
+        # 对于较长的条（|val| > 0.3），标签放在条形内部；否则放在外部
+        if abs(val) > 0.3:
+            # 标签放在条形内部
+            if val >= 0:
+                x_pos = val - 0.02
+                ha = 'right'
+            else:
+                x_pos = val + 0.02
+                ha = 'left'
+            text_color = 'white'
+        else:
+            # 标签放在条形外部
+            if val >= 0:
+                x_pos = val + 0.02
+                ha = 'left'
+            else:
+                x_pos = val - 0.02
+                ha = 'right'
+            text_color = 'black'
+        ax2.text(x_pos, bar.get_y() + bar.get_height()/2,
+                 f'{val:.3f}', va='center', ha=ha, fontsize=10, fontweight='bold', color=text_color)
     
-    plt.tight_layout()
+    # 美化 Y 轴标签
+    ax2.set_yticklabels(correlations_sorted.index, fontsize=11)
+    
+    plt.tight_layout(pad=2.0)
     plt.show()
     
     # 打印统计

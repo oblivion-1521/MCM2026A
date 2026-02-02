@@ -13,7 +13,8 @@ from battery_physics import (
 )
 # 引入新的功率计算模块
 from Power_options import read_and_compute_power
-from aging import simulate_power_depletion_with_aging, plot_aging_comparison
+from aging import simulate_power_depletion_with_aging
+from visualization import plot_power_depletion_simulation, plot_aging_comparison
 
 def get_clean_data_from_cycle(cycle_data, cycle_id):
     I_raw = np.abs(cycle_data['data']['current_measured'])
@@ -64,7 +65,7 @@ def thermal_fit_wrapper(packed_inputs, mCp, c):
     return np.concatenate(all_preds)
 
 
-def main(device_id='DEV_0013', capacity_sim=3.497, aging=False, lambda_aging=0.2):
+def main(device_id='DEV_0013', capacity_sim=3.497, aging=False, lambda_aging=0.2, D_aging=0.0):
     # ==========================================
     # Step 1: 加载 NASA 电池数据 (用于训练参数)
     # ==========================================
@@ -204,10 +205,10 @@ def main(device_id='DEV_0013', capacity_sim=3.497, aging=False, lambda_aging=0.2
     # 阶跃插值生成 P(t)
     # 使用阶跃插值（零阶保持），假设两个日志点之间功率保持不变
     # kind='zero' 或 'previous' 表示取前一个点的值
-    P_sim = np.interp(t_sim, t_source_sec, P_source_watts)
-    # interp_func = interp1d(t_source_sec, P_source_watts, kind='zero', 
-    #                        bounds_error=False, fill_value=(P_source_watts[0], P_source_watts[-1]))
-    # P_sim = interp_func(t_sim)
+    # P_sim = np.interp(t_sim, t_source_sec, P_source_watts)
+    interp_func = interp1d(t_source_sec, P_source_watts, kind='zero', 
+                           bounds_error=False, fill_value=(P_source_watts[0], P_source_watts[-1]))
+    P_sim = interp_func(t_sim)
 
 
     
@@ -227,104 +228,39 @@ def main(device_id='DEV_0013', capacity_sim=3.497, aging=False, lambda_aging=0.2
         V_cutoff=V_cutoff_sim
     )
     
-  # ==========================================
-    # Step 5: 结果可视化 (包含模型拟合验证 和 现实功率仿真)
     # ==========================================
-    print("\n>>> Generating Visualizations...")
-
-    # 获取仿真结束的具体时间
-    t_end = sim_result['t'][-1]
-
-    # --- 1. 模型拟合验证图 (略，保持你之前的代码不变) ---
-    # ... (这部分代码建议保留在你原本的位置) ...
-
-    # --- 2. 现实功耗耗尽仿真图 (针对 Power_options 的 CSV 数据) ---
-    plt.figure(figsize=(14, 12))
+    # Step 5: 结果可视化
+    # ==========================================
+    print("\n>>> [Step 5] Generating Visualizations...")
     
-    # 子图 A: 输入功率与计算出的电流
-    plt.subplot(3, 1, 1)
-    
-    # 【核心修改点】：过滤原始日志点，只保留仿真运行时间范围内的数据
-    mask = t_source_sec <= t_end
-    t_log_filtered = t_source_sec[mask]
-    P_log_filtered = P_source_watts[mask]
-
-    # 绘制过滤后的原始采样点
-    plt.scatter(t_log_filtered, P_log_filtered, color='black', marker='x', label='Original Log Points (W)', alpha=0.6)
-    
-    # 绘制插值后的连续功率曲线 (使用 sim_result 中的数据，它是已经根据耗尽时间截断好的)
-    plt.plot(sim_result['t'], sim_result['P'], color='green', alpha=0.4, label='Interpolated P_in (W)')
-    
-    # 绘制计算出的响应电流
-    plt.plot(sim_result['t'], sim_result['I'], color='blue', linestyle='--', label='Calculated I_out (A)')
-    
-    plt.ylabel('Power (W) / Current (A)')
-    plt.title('Simulation Part 1: Real-world Power Profile & Battery Current Response')
-    plt.legend(loc='upper right')
-    plt.grid(True, alpha=0.3)
-    
-    # 设置 X 轴范围，使三个图的横轴对齐到仿真结束时刻
-    plt.xlim(-1000, t_end + 1000) 
-    
-    # 子图 B: 电压下降与 SOC 消耗
-    plt.subplot(3, 1, 2)
-    ax_v = plt.gca()
-    ax_soc = ax_v.twinx()
-    
-    ax_v.plot(sim_result['t'], sim_result['V'], 'red', label='Terminal Voltage (V)', linewidth=1.5)
-    ax_v.axhline(y=V_cutoff_sim, color='red', linestyle=':', label='Cutoff Voltage')
-    ax_soc.plot(sim_result['t'], sim_result['SOC']*100, 'black', label='SOC (%)', linewidth=2)
-    
-    ax_v.set_ylabel('Voltage (V)', color='red')
-    ax_soc.set_ylabel('SOC (%)', color='black')
-    ax_v.set_title(f'Simulation Part 2: Voltage and SOC Depletion (Capacity: {capacity_sim} Ah)')
-    ax_v.set_xlim(-1000, t_end + 1000)
-    
-    h1, l1 = ax_v.get_legend_handles_labels()
-    h2, l2 = ax_soc.get_legend_handles_labels()
-    ax_v.legend(h1+h2, l1+l2, loc='lower left')
-    ax_v.grid(True, alpha=0.3)
-    
-    # 子图 C: 电池发热情况
-    plt.subplot(3, 1, 3)
-    plt.plot(sim_result['t'], sim_result['T'], color='orange', linewidth=2, label='Simulated Battery Temp')
-    plt.axhline(y=T_env_sim, color='gray', linestyle='--', label='Ambient Temperature')
-    plt.xlabel('Simulation Time (seconds)')
-    plt.ylabel('Temperature (°C)')
-    plt.title('Simulation Part 3: Battery Thermal Profile during Usage')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.xlim(-1000, t_end + 1000)
-    
-    plt.tight_layout()
-    plt.show()
-
-    # 打印仿真统计信息 (保持不变)
-    duration_hrs = t_end / 3600.0
-    print(f"\n[Simulation Summary]")
-    print(f"Total simulated time: {t_end:.1f} s ({duration_hrs:.2f} hours)")
-    print(f"Final SOC: {sim_result['SOC'][-1]*100:.2f} %") 
+    plot_power_depletion_simulation(
+        sim_result, t_source_sec, P_source_watts,
+        capacity_sim, T_env_sim, V_cutoff_sim
+    )
 
     # ==========================================
     # Step 6: 老化电池仿真 (可选)
     # ==========================================
     if aging:
         print(f"\n>>> [Step 6] Running Aging Simulation (λ={lambda_aging})...")
-        
+        print(f"    Internal resistance increase: {lambda_aging*100:.1f}%")
+        print(f"    Capacity degradation: {D_aging*100:.1f}% (C_eff = {capacity_sim*(1-D_aging):.3f} Ah)")
+
         sim_result_aging = simulate_power_depletion_with_aging(
             t_sim, P_sim,
             SOC_init_sim, T_init_sim, T_env_sim, capacity_sim,
             R_base_fit, k_fit, mCp_fit, c_fit,
             lambda_aging=lambda_aging,
+            D_aging=D_aging,
             V_cutoff=V_cutoff_sim
         )
         
-        plot_aging_comparison(sim_result, sim_result_aging, lambda_aging, V_cutoff_sim)
+        plot_aging_comparison(sim_result, sim_result_aging, lambda_aging, D_aging, V_cutoff_sim)
 
 if __name__ == "__main__":
     device_id = 'DEV_0030'  # 可以修改为其他设备ID
     capacity_sim = 3.951
     # 截止电压为 3V
     # aging=True 开启老化仿真，lambda_aging 为老化系数(内阻增加比例)
-    main(device_id=device_id, capacity_sim=capacity_sim, aging=True, lambda_aging=4.2)
+    main(device_id=device_id, capacity_sim=capacity_sim, aging=True, lambda_aging=1.5, D_aging=0.2)
 # %%

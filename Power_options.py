@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
-
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 def read_and_compute_power(csv_file='../battery_dataset_sample.csv', device_id='DEV_0013'):
     """
     读取 CSV 文件，只保留指定 device_id 的数据，

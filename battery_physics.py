@@ -208,7 +208,7 @@ def simulate_power_depletion(
         res_T[i] = curr_T
         
         # 5. 检查截止条件
-        if V_val <= V_cutoff or curr_SOC <= 0.005: # 留一点余量防止除零
+        if V_val <= V_cutoff or curr_SOC <= 0.05: # 留一点余量防止除零
             # print(f"Simulation stopped at t={t_curr:.1f}s: Cutoff reached (V={V_val:.2f}, SOC={curr_SOC:.2f})")
             end_idx = i + 1
             break

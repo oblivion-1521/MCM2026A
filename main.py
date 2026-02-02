@@ -1,13 +1,18 @@
 #%%
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
+from scipy.interpolate import interp1d
 
+# 引入之前的模块
 from nasa_battery_reader import load_battery_data
 from battery_physics import (
     cul_SOC, get_OCV, total_voltage_model, 
     get_internal_resistance, thermal_model_simulation, simulate_power_depletion
 )
+# 引入新的功率计算模块
+from Power_options import read_and_compute_power
 
 def get_clean_data_from_cycle(cycle_data, cycle_id):
     I_raw = np.abs(cycle_data['data']['current_measured'])
@@ -19,15 +24,13 @@ def get_clean_data_from_cycle(cycle_data, cycle_id):
     else:
          T_raw = cycle_data['data']['temperature_measured']
     
-    # 确保 T_env 存在，NASA数据集中 ambient_temperature 通常是标量
     T_env_val = cycle_data['ambient_temperature']
     T_env_raw = np.full_like(t_raw, T_env_val)
          
     Q = cycle_data['data']['capacity']
     soc_raw = cul_SOC(I_raw, t_raw, Q)
     
-    # 筛选: 放电 (I>0.05) 且 SOC [0.1, 1.0] 
-    # 热模型建议保留到放电开始，否则初始温度不好定
+    # 筛选数据用于拟合
     mask = (I_raw > 0.05) & (soc_raw >= 0.0) & (soc_raw <= 0.9)
     
     clean_data = {
@@ -42,37 +45,29 @@ def get_clean_data_from_cycle(cycle_data, cycle_id):
     return clean_data
 
 # === 包装函数：用于热参数拟合 ===
-# 因为 curve_fit 只接受一个输入数组 x，我们需要把所有片段的数据打包
 def thermal_fit_wrapper(packed_inputs, mCp, c):
-    """
-    这是一个中间层，用于处理多段数据的拼接预测。
-    packed_inputs 包含: (R_base, k_low_soc, list_of_cycle_data)
-    """
-    # 解包固定参数和数据
     R_base, k_low_soc, data_list = packed_inputs
-    
     all_preds = []
     
     for data in data_list:
-        # 准备单个片段的仿真输入
-        # inputs: (time_arr, I_arr, T_env_arr, SOC_arr, T_init)
         sim_inputs = (
             data['t'], 
             data['I'], 
             data['T_env'], 
             data['SOC'], 
-            data['T'][0] # 使用真实测量的初始温度作为仿真起点
+            data['T'][0] 
         )
-        
-        # 运行仿真
         T_pred = thermal_model_simulation(sim_inputs, mCp, c, R_base, k_low_soc)
         all_preds.append(T_pred)
         
     return np.concatenate(all_preds)
 
 
-def main():
-    # 1. 数据源
+def main(device_id='DEV_0013', capacity_sim=3.497):
+    # ==========================================
+    # Step 1: 加载 NASA 电池数据 (用于训练参数)
+    # ==========================================
+    # 请确保路径正确
     sources = [
         {'file': '../Battery Data Set/3/B0038.mat', 'cycle_idx': 0}, 
         {'file': '../Battery Data Set/3/B0038.mat', 'cycle_idx': 1}, 
@@ -83,39 +78,43 @@ def main():
     combined_data = {'I': [], 'V': [], 'T': [], 'OCV': [], 'SOC': []}
     validation_list = [] 
     
-    print(">>> [Step 1] Loading Data...")
+    print(">>> [Step 1] Loading Training Data (NASA B0038)...")
     
     for src in sources:
         fpath = src['file']
         c_idx = src['cycle_idx']
         
-        if fpath not in loaded_files:
-            loaded_files[fpath] = load_battery_data(fpath)
-        
-        all_cycles = loaded_files[fpath]
-        discharge_cycles = [c for c in all_cycles if c['type'] == 'discharge']
-        
-        if c_idx >= len(discharge_cycles): continue
-        target = discharge_cycles[c_idx]
-        
-        clean = get_clean_data_from_cycle(target, target['cycle_id'])
-        if len(clean['V']) == 0: continue
+        try:
+            if fpath not in loaded_files:
+                loaded_files[fpath] = load_battery_data(fpath)
             
-        clean['OCV'] = get_OCV(clean['SOC'])
-        
-        # 收集用于电压拟合
-        combined_data['I'].append(clean['I'])
-        combined_data['V'].append(clean['V'])
-        combined_data['T'].append(clean['T'])
-        combined_data['OCV'].append(clean['OCV'])
-        combined_data['SOC'].append(clean['SOC'])
-        
-        # 收集用于热拟合 (保存列表结构)
-        validation_list.append(clean)
+            all_cycles = loaded_files[fpath]
+            discharge_cycles = [c for c in all_cycles if c['type'] == 'discharge']
+            
+            if c_idx >= len(discharge_cycles): continue
+            target = discharge_cycles[c_idx]
+            
+            clean = get_clean_data_from_cycle(target, target['cycle_id'])
+            if len(clean['V']) == 0: continue
+                
+            clean['OCV'] = get_OCV(clean['SOC'])
+            
+            combined_data['I'].append(clean['I'])
+            combined_data['V'].append(clean['V'])
+            combined_data['T'].append(clean['T'])
+            combined_data['OCV'].append(clean['OCV'])
+            combined_data['SOC'].append(clean['SOC'])
+            validation_list.append(clean)
+            
+        except FileNotFoundError:
+            print(f"Warning: File {fpath} not found. Skipping.")
+            continue
 
-    if not combined_data['V']: return
+    if not combined_data['V']: 
+        print("Error: No valid data loaded. Check paths.")
+        return
 
-    # 拼接训练数据 (电压部分)
+    # 拼接训练数据
     train_I = np.concatenate(combined_data['I'])
     train_V = np.concatenate(combined_data['V'])
     train_T = np.concatenate(combined_data['T'])
@@ -123,9 +122,9 @@ def main():
     train_SOC = np.concatenate(combined_data['SOC'])
     
     # ==========================================
-    # Step 2: 拟合电压/内阻参数 (R_base, k_low_soc)
+    # Step 2: 拟合电气参数 (R_base, k_low_soc)
     # ==========================================
-    print("\n>>> [Step 2] Fitting Electrical Parameters (R_base, k_low_soc)...")
+    print("\n>>> [Step 2] Fitting Electrical Parameters...")
     
     x_data_elec = (train_I, train_OCV, train_T, train_SOC)
     p0_elec = [0.1, 0.01]
@@ -134,7 +133,6 @@ def main():
     try:
         popt_elec, _ = curve_fit(total_voltage_model, x_data_elec, train_V, p0=p0_elec, bounds=bounds_elec)
         R_base_fit, k_fit = popt_elec
-        print(f"  Fit Success!")
         print(f"  R_base    = {R_base_fit:.6f} Ohm")
         print(f"  k_low_soc = {k_fit:.6f} Ohm")
     except Exception as e:
@@ -144,164 +142,169 @@ def main():
     # ==========================================
     # Step 3: 拟合热参数 (mCp, c)
     # ==========================================
-    print("\n>>> [Step 3] Fitting Thermal Parameters (mCp, c)...")
-    
-    # 准备热拟合的数据包
-    # 我们不直接传递 huge array，而是传递 cycle 列表，以便 wrapper 分别积分
-    # curve_fit 要求 xdata 必须是 array-like 且长度与 ydata 一致，这里我们用个 trick
-    # 这里的 x_data 实际上不被 func 直接使用，我们通过 partial 或 lambda 闭包传递真实结构
-    # 但最标准的做法是利用 wrapper
+    print("\n>>> [Step 3] Fitting Thermal Parameters...")
     
     packed_inputs = (R_base_fit, k_fit, validation_list)
-    
-    # 目标 Y 值：所有片段的真实温度拼在一起
     train_T_all = np.concatenate([d['T'] for d in validation_list])
     
-    # 定义 lambda 函数，固定 inputs，只暴露 (x, mCp, c) 给 curve_fit
-    # 注意：curve_fit 调用的函数形式 func(x, p1, p2)，x 必须存在
-    # 这里我们传一个伪造的 x，在 wrapper 里直接忽略 x，使用 closed-over 的 packed_inputs
-    # 为了兼容性，wrapper 还是设计成接收 packed_inputs
-    
-    # 修正：scipy 的 curve_fit 不支持传递复杂对象作为 x。
-    # 我们改用 lambda 闭包，让 curve_fit 认为 x 是 dummy
     def fit_func_thermal(dummy_x, mCp, c):
         return thermal_fit_wrapper(packed_inputs, mCp, c)
     
-    # 初始猜测
-    # mCp: 18650电池约 45g, Cp~1000 J/kgK -> mCp ~ 45 J/K
-    # c: h*A, A~0.004 m2, h~10 W/m2K -> c ~ 0.04 W/K
     p0_therm = [45.0, 0.04] 
     bounds_therm = ([1.0, 0.001], [500.0, 10.0])
     
     try:
-        # dummy_x 长度必须和 train_T_all 一致
         dummy_x = np.zeros_like(train_T_all)
         popt_therm, _ = curve_fit(fit_func_thermal, dummy_x, train_T_all, p0=p0_therm, bounds=bounds_therm)
         mCp_fit, c_fit = popt_therm
-        
-        print(f"  Fit Success!")
         print(f"  mCp (Thermal Mass) = {mCp_fit:.4f} J/K")
         print(f"  c   (Heat Transfer)= {c_fit:.4f} W/K")
-        
     except Exception as e:
         print(f"  Thermal Fit Failed: {e}")
+        # 如果拟合失败，使用默认值防止程序崩溃
+        mCp_fit, c_fit = 45.0, 0.05
+        print("  Using default thermal parameters.")
+
+    # ==========================================
+    # Step 4: 读取真实功率数据并仿真
+    # ==========================================
+    print("\n>>> [Step 4] Loading Real-World Power Profile from Power_options...")
+    
+    # 1. 读取 CSV 数据并计算功率
+    try:
+        # 假设 CSV 路径如下，如果不在这里请修改
+        csv_path = '../battery_dataset_sample.csv'
+        df_power = read_and_compute_power(csv_path, device_id=device_id)
+    except FileNotFoundError:
+        print(f"Error: CSV file not found at {csv_path}")
         return
+    except ValueError as e:
+        print(f"Error: {e}")
+        return
+        
+    print(f"  Loaded {len(df_power)} rows for {device_id}.")
+    
+    # 2. 数据预处理
+    # 提取时间并转换为相对秒数 (t=0 at start)
+    t_start = df_power['timestamp'].iloc[0]
+    df_power['time_sec'] = (df_power['timestamp'] - t_start).dt.total_seconds()
+    
+    # 提取模型计算的总功率 (mW) 并转换为 (W)
+    # 注意：battery_physics 模型内部使用的是标准单位 (Amps, Volts, Ohms, Watts)
+    P_source_watts = df_power['P_total_model_mW'].values / 1000.0
+    t_source_sec = df_power['time_sec'].values
+    
+    # 3. 创建仿真时间轴 (Resampling)
+    # 原始数据是稀疏的（每几分钟一个点），我们需要 1秒步长的连续数据进行积分
+    sim_dt = 1.0 
+    t_max = t_source_sec[-1]
+    t_sim = np.arange(0, t_max, sim_dt)
+    
+    # 阶跃插值生成 P(t)
+    # 使用阶跃插值（零阶保持），假设两个日志点之间功率保持不变
+    # kind='zero' 或 'previous' 表示取前一个点的值
+    interp_func = interp1d(t_source_sec, P_source_watts, kind='zero', 
+                           bounds_error=False, fill_value=(P_source_watts[0], P_source_watts[-1]))
+    P_sim = interp_func(t_sim)
 
-    # ==========================================
-    # Step 4: 结果可视化
-    # ==========================================
-    print("\n>>> Generating Plots...")
-    num_plots = len(validation_list)
-    plt.figure(figsize=(12, 5 * num_plots))
-    
-    for i, data in enumerate(validation_list):
-        # 1. 预测电压
-        v_inputs = (data['I'], data['OCV'], data['T'], data['SOC'])
-        V_pred = total_voltage_model(v_inputs, R_base_fit, k_fit)
-        
-        # 2. 预测温度 (使用拟合出的热参数)
-        sim_inputs = (data['t'], data['I'], data['T_env'], data['SOC'], data['T'][0])
-        T_pred = thermal_model_simulation(sim_inputs, mCp_fit, c_fit, R_base_fit, k_fit)
-        
-        # --- 子图 1: 电压 ---
-        ax1 = plt.subplot(num_plots, 2, i*2 + 1)
-        ax1.plot(data['SOC'], data['V'], 'k-', label='Measured V')
-        ax1.plot(data['SOC'], V_pred, 'r--', label='Model V')
-        ax1.set_title(f"Cycle {data['cycle_id']} - Voltage")
-        ax1.set_xlabel('SOC')
-        ax1.set_ylabel('Voltage (V)')
-        ax1.invert_xaxis()
-        ax1.legend()
-        ax1.grid(True, linestyle='--', alpha=0.5)
-        
-        # --- 子图 2: 温度 ---
-        ax2 = plt.subplot(num_plots, 2, i*2 + 2)
-        # 用时间轴画温度更直观
-        t_norm = data['t'] - data['t'][0]
-        ax2.plot(t_norm, data['T'], 'k-', label='Measured T')
-        ax2.plot(t_norm, T_pred, 'r--', label='Model T')
-        ax2.set_title(f"Cycle {data['cycle_id']} - Temperature Fit")
-        ax2.set_xlabel('Time (s)')
-        ax2.set_ylabel('Temperature (°C)')
-        ax2.legend()
-        ax2.grid(True, linestyle='--', alpha=0.5)
-        
-        # 添加参数文本
-        info_text = (f"mCp={mCp_fit:.1f}\nc={c_fit:.3f}")
-        ax2.text(0.05, 0.95, info_text, transform=ax2.transAxes, 
-                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
-    plt.tight_layout()
-    plt.show()
-
-    print("\n>>> [Step 5] Running Constant Power Depletion Simulation...")
     
-    # 1. 定义仿真条件
-    # 假设一个恒定功率负载，例如 4W (手机高负载游戏场景)
-    # 或者构造一个随时间变化的 P(t)
-    sim_duration = 3600 * 2  # 模拟 2 小时
-    dt = 1.0                 # 时间步长 1s
-    t_sim = np.arange(0, sim_duration, dt)
+    # 环境参数
+    T_env_sim = 25.0 
+    T_init_sim = 25.0
+    SOC_init_sim = 1.0 # 假设满电开始
+    V_cutoff_sim = 3.0 # 截止电压
     
-    # 构造 P(t): 前10分钟 1W (待机), 之后 4.5W (打游戏)
-    P_sim = np.ones_like(t_sim) * 1.0 
-    P_sim[600:] = 4.5 
+    print(f"  Starting Simulation: Duration={t_max/3600:.2f} hours, Capacity={capacity_sim} Ah")
     
-    # 电池参数 (从数据集中读取容量，或者假设一个值)
-    # NASA B0038 容量约为 1.1 Ah 左右 (根据数据)
-    # 这里我们取第一个 cycle 的容量
-    real_capacity = validation_list[0]['I'].sum() * (validation_list[0]['t'][1]-validation_list[0]['t'][0]) / 3600 / (1-validation_list[0]['SOC'][-1])
-    # 粗略估算一下，或者直接给 1.1
-    capacity_sim = 1.1 
-    
-    T_env_sim = 24.0 # 环境温度
-    T_init_sim = 24.0
-    SOC_init_sim = 1.0
-    
-    # 2. 运行仿真
+    # 5. 运行仿真
     sim_result = simulate_power_depletion(
         t_sim, P_sim, 
         SOC_init_sim, T_init_sim, T_env_sim, capacity_sim,
         R_base_fit, k_fit, mCp_fit, c_fit,
-        V_cutoff=2.7
+        V_cutoff=V_cutoff_sim
     )
     
-    # 3. 绘图验证
-    plt.figure(figsize=(10, 8))
+  # ==========================================
+    # Step 5: 结果可视化 (包含模型拟合验证 和 现实功率仿真)
+    # ==========================================
+    print("\n>>> Generating Visualizations...")
+
+    # 获取仿真结束的具体时间
+    t_end = sim_result['t'][-1]
+
+    # --- 1. 模型拟合验证图 (略，保持你之前的代码不变) ---
+    # ... (这部分代码建议保留在你原本的位置) ...
+
+    # --- 2. 现实功耗耗尽仿真图 (针对 Power_options 的 CSV 数据) ---
+    plt.figure(figsize=(14, 12))
     
-    # Plot 1: Power & Current
+    # 子图 A: 输入功率与计算出的电流
     plt.subplot(3, 1, 1)
-    plt.plot(sim_result['t'], sim_result['P'], 'g--', label='Input Power (W)')
-    plt.plot(sim_result['t'], sim_result['I'], 'b-', label='Calculated Current (A)')
-    plt.ylabel('Magnitude')
-    plt.title('Simulation: Power Input -> Current Response')
-    plt.legend(loc='best')
-    plt.grid(True)
     
-    # Plot 2: Voltage & SOC
+    # 【核心修改点】：过滤原始日志点，只保留仿真运行时间范围内的数据
+    mask = t_source_sec <= t_end
+    t_log_filtered = t_source_sec[mask]
+    P_log_filtered = P_source_watts[mask]
+
+    # 绘制过滤后的原始采样点
+    plt.scatter(t_log_filtered, P_log_filtered, color='black', marker='x', label='Original Log Points (W)', alpha=0.6)
+    
+    # 绘制插值后的连续功率曲线 (使用 sim_result 中的数据，它是已经根据耗尽时间截断好的)
+    plt.plot(sim_result['t'], sim_result['P'], color='green', alpha=0.4, label='Interpolated P_in (W)')
+    
+    # 绘制计算出的响应电流
+    plt.plot(sim_result['t'], sim_result['I'], color='blue', linestyle='--', label='Calculated I_out (A)')
+    
+    plt.ylabel('Power (W) / Current (A)')
+    plt.title('Simulation Part 1: Real-world Power Profile & Battery Current Response')
+    plt.legend(loc='upper right')
+    plt.grid(True, alpha=0.3)
+    
+    # 设置 X 轴范围，使三个图的横轴对齐到仿真结束时刻
+    plt.xlim(-1000, t_end + 1000) 
+    
+    # 子图 B: 电压下降与 SOC 消耗
     plt.subplot(3, 1, 2)
-    ax1 = plt.gca()
-    ax2 = ax1.twinx()
-    ax1.plot(sim_result['t'], sim_result['V'], 'r-', label='Voltage (V)')
-    ax2.plot(sim_result['t'], sim_result['SOC'], 'k:', label='SOC')
-    ax1.set_ylabel('Voltage (V)', color='r')
-    ax2.set_ylabel('SOC', color='k')
-    ax1.set_title('Simulation: Voltage and SOC Drop')
-    ax1.grid(True)
+    ax_v = plt.gca()
+    ax_soc = ax_v.twinx()
     
-    # Plot 3: Temperature
+    ax_v.plot(sim_result['t'], sim_result['V'], 'red', label='Terminal Voltage (V)', linewidth=1.5)
+    ax_v.axhline(y=V_cutoff_sim, color='red', linestyle=':', label='Cutoff Voltage')
+    ax_soc.plot(sim_result['t'], sim_result['SOC']*100, 'black', label='SOC (%)', linewidth=2)
+    
+    ax_v.set_ylabel('Voltage (V)', color='red')
+    ax_soc.set_ylabel('SOC (%)', color='black')
+    ax_v.set_title(f'Simulation Part 2: Voltage and SOC Depletion (Capacity: {capacity_sim} Ah)')
+    ax_v.set_xlim(-1000, t_end + 1000)
+    
+    h1, l1 = ax_v.get_legend_handles_labels()
+    h2, l2 = ax_soc.get_legend_handles_labels()
+    ax_v.legend(h1+h2, l1+l2, loc='lower left')
+    ax_v.grid(True, alpha=0.3)
+    
+    # 子图 C: 电池发热情况
     plt.subplot(3, 1, 3)
-    plt.plot(sim_result['t'], sim_result['T'], 'orange', label='Temperature (C)')
-    plt.axhline(y=T_env_sim, color='gray', linestyle='--', label='Ambient T')
-    plt.ylabel('Temp (°C)')
-    plt.xlabel('Time (s)')
-    plt.title('Simulation: Temperature Rise')
+    plt.plot(sim_result['t'], sim_result['T'], color='orange', linewidth=2, label='Simulated Battery Temp')
+    plt.axhline(y=T_env_sim, color='gray', linestyle='--', label='Ambient Temperature')
+    plt.xlabel('Simulation Time (seconds)')
+    plt.ylabel('Temperature (°C)')
+    plt.title('Simulation Part 3: Battery Thermal Profile during Usage')
     plt.legend()
-    plt.grid(True)
+    plt.grid(True, alpha=0.3)
+    plt.xlim(-1000, t_end + 1000)
     
     plt.tight_layout()
     plt.show()
 
+    # 打印仿真统计信息 (保持不变)
+    duration_hrs = t_end / 3600.0
+    print(f"\n[Simulation Summary]")
+    print(f"Total simulated time: {t_end:.1f} s ({duration_hrs:.2f} hours)")
+    print(f"Final SOC: {sim_result['SOC'][-1]*100:.2f} %") 
+
 if __name__ == "__main__":
-    main()
+    device_id = 'DEV_0030'  # 可以修改为其他设备ID
+    capacity_sim = 3.951
+    main(device_id=device_id, capacity_sim=capacity_sim)
 # %%
